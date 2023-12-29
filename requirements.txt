@@ -1,0 +1,6 @@
+# controlnet
+controlnet-aux==0.0.7
+
+# render
+trimesh
+pyrender
