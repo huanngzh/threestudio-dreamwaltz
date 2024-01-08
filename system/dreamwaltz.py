@@ -1,17 +1,11 @@
-import functools
 from dataclasses import dataclass, field
 
-import torch
 import torch.nn.functional as F
-import trimesh
 
 import threestudio
 from threestudio.systems.base import BaseLift3DSystem
-from threestudio.utils.misc import get_device
 from threestudio.utils.ops import binary_cross_entropy, dot
 from threestudio.utils.typing import *
-
-from ..utils import render_mesh as render_tools
 
 
 @threestudio.register("dreamwaltz-system")
@@ -20,38 +14,17 @@ class DreamWaltz(BaseLift3DSystem):
     class Config(BaseLift3DSystem.Config):
         freq: dict = field(default_factory=dict)
 
-        warmup_steps: int = 2000
+        stage: Optional[str] = None  # warmup, nerf
+        skip_warmup: bool = False
+        warmup_steps: int = 2000  # only used when skip_warmup is False
 
-        prior_path: str = "custom/threestudio-dreamwaltz/load/priors/smpl_apose.obj"
-        prior_radius: float = 0.7
-        prior_rotate: str = "threestudio"  # in ['threestudio', 'meshlab', 'glb']
-        prior_view_hw: Optional[Tuple[int, int]] = None
-
-        controlnet_ref_types: List[str] = field(
-            default_factory=lambda: ["rgb"]
-        )  # in ['rgb', 'depth']
+        controlnet_ref_types: List[str] = field(default_factory=lambda: ["pose"])
 
     cfg: Config
 
     def configure(self):
         # create geometry, material, background, renderer
         super().configure()
-
-        assert self.cfg.prior_path is not None, "Prior path is required."
-        self.prior = trimesh.load(
-            self.cfg.prior_path, force="scene", merge_primitives=True
-        )
-        self.prior_scene, nc, nl = render_tools.prepare_pyrender_scene(
-            self.prior,
-            preprocess_mesh=True,
-            normalize_mesh=True,
-            radius=self.cfg.prior_radius,
-            source=self.cfg.prior_rotate,
-        )
-        self.render_prior = functools.partial(
-            render_tools.render_scene, self.prior_scene, nc, nl
-        )
-        threestudio.info(f"Using observation prior: {self.cfg.prior_path}")
 
         self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
             self.cfg.prompt_processor
@@ -69,62 +42,89 @@ class DreamWaltz(BaseLift3DSystem):
         super().on_fit_start()
 
     def training_step(self, batch, batch_idx):
-        def _get_prior_view(view_hw=None) -> Float[Tensor, "B H W C"]:
-            if view_hw is not None:
-                height, width = view_hw
-            else:
-                rgb_wh = out["comp_rgb"] if "comp_rgb" in out else out["comp_normal"]
-                height, width = rgb_wh.shape[1:3]
-            device = get_device()
-
-            colors, depths = [], []
-            for i in range(batch["fovy"].shape[0]):
-                color, depth = self.render_prior(
-                    batch["c2w"][i].cpu().numpy(),
-                    batch["fovy"][i].item(),
-                    width=width,
-                    height=height,
-                )
-                color = torch.from_numpy(color.copy()) / 255.0
-                depth = torch.from_numpy(depth.copy() / depth.max())
-                depth = depth.unsqueeze(-1).repeat(1, 1, 3)
-                colors.append(color)
-                depths.append(depth)
-
-            return torch.stack(colors, dim=0).to(device), torch.stack(depths, dim=0).to(
-                device
-            )
-
         out = self(batch)
         prompt_utils = self.prompt_processor()
 
         guidance_eval = (
-            self.true_global_step >= self.cfg.warmup_steps
-            and self.cfg.freq.guidance_eval > 0
+            self.cfg.freq.guidance_eval > 0
             and self.true_global_step % self.cfg.freq.guidance_eval == 0
         )
 
         loss = 0.0
 
-        if self.true_global_step < self.cfg.warmup_steps:
+        if self.cfg.stage == "warmup" or (
+            self.true_global_step < self.cfg.warmup_steps and not self.cfg.skip_warmup
+        ):
             # warmup
-            gt_views, gt_depths = _get_prior_view()
-            img_mask = (gt_depths.detach() > 0).float()
+            assert (
+                "mesh" in batch and "depth" in batch
+            ), "Mesh and depth are required in warmup stage."
+            gt_views = batch["mesh"].to(out["comp_rgb"].dtype)
+            gt_depths = batch["depth"].to(out["comp_rgb"].dtype)
+            if gt_views.shape[1] != out["comp_rgb"].shape[1]:
+                # resize gt_views [B, H, W, C] to match the output size
+                resize_ = lambda x: F.interpolate(
+                    x.permute(0, 3, 1, 2),
+                    size=out["comp_rgb"].shape[1:3],
+                    mode="bilinear",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+                gt_views = resize_(gt_views)
+                gt_depths = resize_(gt_depths)[..., :1]
+
+            img_mask = (gt_depths.detach() > 1e-6).float()
             loss_l2 = F.mse_loss(
                 out["comp_rgb"] * img_mask, gt_views.detach() * img_mask
             )
             self.log("train/loss_l2", loss_l2)
             loss += loss_l2 * self.C(self.cfg.loss.lambda_l2)
 
+            if guidance_eval:
+                # save warmup ground truth images
+                self.save_image_grid(
+                    f"it{self.true_global_step}-gt.png",
+                    [
+                        {
+                            "type": "rgb",
+                            "img": batch["mesh"][0],
+                            "kwargs": {"data_format": "HWC"},
+                        },
+                    ]
+                    + (
+                        [
+                            {
+                                "type": "grayscale",
+                                "img": batch["depth"][0, :, :, 0],
+                                "kwargs": {"cmap": None, "data_range": (0, 1)},
+                            }
+                        ]
+                        if "depth" in batch
+                        else []
+                    )
+                    + (
+                        [
+                            {
+                                "type": "rgb",
+                                "img": batch["pose"][0],
+                                "kwargs": {"data_format": "HWC"},
+                            }
+                        ]
+                        if "pose" in batch
+                        else []
+                    ),
+                )
+
         else:
             # prepare condition reference images
             cond_rgbs = []
             for ref_type in self.cfg.controlnet_ref_types:
-                # use prior view as control
-                cond_rgb, cond_depth = _get_prior_view(self.cfg.prior_view_hw)
-                if ref_type == "depth":
-                    cond_rgb = cond_depth
-                cond_rgbs.append(cond_rgb)
+                if ref_type not in ["pose", "depth"]:
+                    raise ValueError(f"Invalid controlnet reference type: {ref_type}")
+                if ref_type not in batch:
+                    raise ValueError(
+                        f"Controlnet reference type {ref_type} is not found in the batch. Please check the data config."
+                    )
+                cond_rgbs.append(batch[ref_type])
 
             # guidance
             guidance_out = self.guidance(
@@ -141,6 +141,28 @@ class DreamWaltz(BaseLift3DSystem):
                     self.log(f"train/{name}", value)
                     loss += value * self.C(
                         self.cfg.loss[name.replace("loss_", "lambda_")]
+                    )
+
+            if guidance_eval:
+                # save guidance evaluation images
+                self.guidance_evaluation_save(
+                    out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
+                    guidance_out["eval"],
+                )
+
+                # visualize controlnet condition images
+                if "controlnet_cond_images" in guidance_out:
+                    controlnet_cond_images = [
+                        {
+                            "type": "rgb",
+                            "img": cond_image[0],
+                            "kwargs": {"data_format": "CHW"},
+                        }
+                        for cond_image in guidance_out["controlnet_cond_images"]
+                    ]
+                    self.save_image_grid(
+                        f"it{self.true_global_step}-cond.png",
+                        controlnet_cond_images,
                     )
 
         if self.C(self.cfg.loss.lambda_orient) > 0:
@@ -166,27 +188,6 @@ class DreamWaltz(BaseLift3DSystem):
 
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
-
-        if guidance_eval:
-            self.guidance_evaluation_save(
-                out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
-                guidance_out["eval"],
-            )
-
-            # visualize controlnet condition images
-            if "controlnet_cond_images" in guidance_out:
-                controlnet_cond_images = [
-                    {
-                        "type": "rgb",
-                        "img": cond_image[0],
-                        "kwargs": {"data_format": "CHW"},
-                    }
-                    for cond_image in guidance_out["controlnet_cond_images"]
-                ]
-                self.save_image_grid(
-                    f"it{self.true_global_step}-cond.png",
-                    controlnet_cond_images,
-                )
 
         return {"loss": loss}
 

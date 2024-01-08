@@ -1,7 +1,9 @@
-name: "dreamwaltz-static"
+name: "dreamwaltz-2-nerf"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
+
+resume: ???
 
 data_type: "smpl-prior-camera-datamodule"
 data:
@@ -27,7 +29,8 @@ data:
 
 system_type: "dreamwaltz-system"
 system:
-  warmup_steps: 2000
+  stage: "nerf"
+  skip_warmup: true
   controlnet_ref_types: ["pose"]
 
   geometry_type: "implicit-volume"
