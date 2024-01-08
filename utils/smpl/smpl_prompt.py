@@ -18,11 +18,8 @@ from .point3d import *
 from .pose import NeRF_data_to_standard, SE3_Mat2RT, index2pose
 
 # NOTE: fill this
-# SMPL_ROOT = "/path/to/smpl_models"
-# VPOSER_ROOT = "/path/to/smpl_models/vposer/V02_05"
-
-SMPL_ROOT = "/data/wlp/projects/diffusion/model_zoo/smpl_model_files"
-VPOSER_ROOT = "/data/wlp/projects/diffusion/model_zoo/smpl_model_files/vposer/V02_05"
+SMPL_ROOT = "/path/to/smpl_models"
+VPOSER_ROOT = "/path/to/smpl_models/vposer/V02_05"
 
 
 def build_human_body_prior(model_path=VPOSER_ROOT):
